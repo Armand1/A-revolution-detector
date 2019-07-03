@@ -1,1 +1,456 @@
-zzdfzdfz
+---
+title: "Revolutions pipeline"
+author: "[Armand Leroi]"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+### preamble
+
+This reproduces the revolutions analysis pipeline given in On Revolutions. We are going to use the pop data set as example. The script was written by Matthias Mauch and modified by Ben Lambert, Armand Leroi and Marina Papadopolou. 
+See blog post by Ted Underwood critiquing the orginal Mauch et al. 2015 method; this revised method incorporates Underwood's recommended permutation on the diagonal https://tedunderwood.com/2016/02/07/you-say-you-found-a-revolution/
+
+### libraries
+```{r}
+library(reshape2)
+library(flexmix)
+library(ggplot2)
+library(plyr)
+library(scales)
+library(sads)
+library(tidyr)
+library(broom)
+library(dplyr)
+library(rstanarm)
+library(rstan)
+options(mc.cores=parallel::detectCores())
+```
+### data
+
+The data are LONG form.  We first extract the relevant variables and rename them so that:
+
+variable = the topic id
+
+value = the mean probability of a topic being found in a year
+
+year = year
+
+```{r}
+d<-read.csv("Hot100_100_means.csv", header=TRUE)
+d<-d[c("year","M_Topic", "mean")]
+names(d)<-c("year", "variable", "value")
+```
+
+### persistence analysis
+We need to analyse the "persistence" of the series.  In brief, we discovered that, if series are "persistent" -- autocorrelated -- the statistical test for revolutions will tend to produce false positives (detect revolutions when there are none).  This is a general feature of time series tests and can be solved by taking the first difference which, however, reduces the power of the test (see On Revolutions for a full discussion of this issue.)  It also changes how we interpret the revolution plots. 
+
+We have to estimate the persistence of the series, a measure called "rho" that takes values between 0 (no persistence, fully mean-reverting) and 1 (max persistence, a random walk.)  In practise we discovered that persistence is a real problem and that for nearly all datasets we have to take the first difference. 
+
+To do the persistence analysis we have to use STAN, a Bayesian time series package. This is wrapped in R, but you will still need to install STAN separately.  That's a bit of a fuss.  Here are instructions. http://mc-stan.org/users/interfaces/rstan. Note that you will need to load a file called "rhoCalculator.stan" which is in the folder.
+
+First we define some STAN functions
+```{r}
+fRW <- function(aT,aSigma,aStartTime,aEndTime,aDriftSigma){
+  X <- vector(length = aT)
+  X[0] <- 0
+  aDrift <- rnorm(1,0,aDriftSigma)
+  for(t in 2:aT){
+    if((t>=aStartTime)&&(t<=aEndTime)){
+      X[t] <- aDrift + X[t-1] + rnorm(1,0,aSigma)
+    }else{
+      X[t] <- X[t-1] + rnorm(1,0,aSigma)
+    }
+  }
+  return(X)
+}
+````
+
+```{r}
+fCreateLagged <- function(mSeries){
+  mSeries <- as.data.frame(mSeries)
+  aT <- nrow(mSeries)
+  mSeries$time <- seq(1,aT,1)
+  mTest1 <- melt(mSeries,id.vars = 'time')
+  mTest2 <- mTest1[mTest1$time!=1,]
+  mTest2$unique <- paste(mTest2$variable,mTest2$time,sep="_")
+  mTest1$unique <- paste(mTest1$variable,mTest1$time+1,sep="_")
+  mTest2$lag <- mTest1$value[match(mTest2$unique,mTest1$unique)]
+  return(mTest2)
+}
+````
+plot the data. It should all be POSITIVE.
+```{r}
+plot<-ggplot()+
+geom_line(data=d, aes(x=year, y=log10(value), group=as.factor(variable)))
+plot
+````
+
+reshape data to WIDTH format
+```{r}
+b<-dcast(d,year~variable, value.var="value")
+````
+Prepare data for STAN
+```{r}
+b$year<-NULL
+b<-as.matrix(b)
+```
+The model.  Note that there are lot of warnings. They can't be suppressed, but can be ignored.
+```{r}
+aModel <- stan_model('rhoCalculator.stan')
+fit <- sampling(aModel,data=list(K=ncol(b),N=nrow(b),X=scale(as.matrix(b))),iter=200,chains=4)
+print(fit)
+```
+check that all Rhat <= 1.1. If not run for more iterations
+
+Pull out the parameter of interest, rho.
+```{r}
+rho <- extract(fit,'rho_average')[[1]]
+hist(rho,100)
+```
+Get the mean and CI of rho
+```{r}
+CI<-c(quantile(rho,0.025),quantile(rho,0.975))
+round(mean(rho),3)
+CI
+````
+We find that the mean = 0.75 and the upper CI embraces 1.  So, on average the pop songs are highly persistent. This means that we should not estimate revolutions of them directly but on their differences.  So we get the first difference, and rerun the analysis:
+```{r}
+c<-diff(b, difference=1)
+```
+The model. Note that there are lot of warnings. They can't be suppressed, but can be ignored.
+```{r}
+aModel <- stan_model('rhoCalculator.stan')
+fit <- sampling(aModel,data=list(K=ncol(c),N=nrow(c),X=scale(as.matrix(c))),iter=200,chains=4)
+print(fit)
+```
+check that all Rhat <~ 1.1. If not run for more iterations
+
+Pull out the parameter of interest, rho.
+```{r}
+rho <- extract(fit,'rho_average')[[1]]
+hist(rho,100)
+```
+Get the mean and CI of rho
+```{r}
+CI<-c(quantile(rho,0.025),quantile(rho,0.975))
+round(mean(rho),3)
+CI
+````
+Now the mean rho is NEGATIVE -0.35, so it's no longer persistent.  We proceed with the differenced data. 
+
+### Make a distance matrix among years
+
+The next step is to make a distance matrix between years.  We are going to use the differenced data. But are going to calculate it again, since we first want to normalize the frequencies since we excluded Topics. There's no year variable in there, so we will have to put it in later.
+
+#### normalize the frequencies
+```{r}
+yearsums<-rowSums(b)
+f<-b/yearsums
+yearsums<-rowSums(f)
+````
+now they all sum to 1. Now, get the 1st differences again
+```{r}
+g<-diff(f, difference=1)
+```
+
+#### get the distance matrix. 
+
+We are going to use KL distance since that's best for Topics.  But we won't scale it since KL distance can't handle that. 
+To use KL distance we have to transpose the data.
+```{r}
+h<-t(g)
+dm<-KLdiv(as.matrix(h))
+````
+Now we are going to put in the names (years of the matrix), removing the first year to account for the fact that the matrix is based on differenced data.
+```{r}
+yearmod<-tail(unique(d$year),-1)
+rownames(dm)<-yearmod
+colnames(dm)<-yearmod
+````
+#### make a heatmap
+```{r}
+heatmap(dm ,Rowv= NA, Colv = NA)
+```
+You'll see that the heatmap of the differences is not NEARLY as pretty as the heatmap of the raw data. But there's still structure in there (we hope) 
+
+### Foote Novelty estimation
+This is a single large function that takes the distance matrix, dm, and FN over all kernal widths, does the bootstrapping on the diagonals, and then gets the significance thresholds. 
+```{r}
+novelty.analysis <- function(dm, width.vector = c(1,2,3), ft.save.drcty = "foote.results.csv",
+                             th.save.drcty = 'foote.thresh.csv', n.boot = 1000)
+  {
+# INITIALIZING: 
+# initialize output dataframes
+  thresholds <- data.frame(matrix(nrow = length(width.vector), ncol = 3))
+  thresh.header <- c('hw', 'lower_2.5', 'upper_97.5')
+  colnames(thresholds) <- thresh.header
+  
+  foote.results <- data.frame(matrix(nrow = (length(dm[1,])*length(width.vector)), ncol = 3))
+  foote.header <- c('year', 'foote.novelty', 'hw')
+  colnames(foote.results) <- foote.header
+#count years
+  years <-  length(rownames(dm))
+  yearnames <- rownames(dm)
+# DEFINING FUNCTIONS : 
+# 1. make the kernal
+  make.foote.kernel <- function(half.width, taper.width.factor=0.4, middle.bit=1) {
+# Make the Foote kernel
+# parameters:
+# taper.width.factor. Width of the Gaussian tapering (default 0.4; 0 = no tapering)
+#middle.bit size of the center (default: 1, as in DoP paper, Foote uses 0)
+  ones <- mat.or.vec(half.width, half.width) + 1
+  short.strip <- mat.or.vec(half.width,middle.bit)
+  top <- cbind(-ones,short.strip,ones)
+  long.strip <- mat.or.vec(middle.bit,2*half.width+middle.bit)
+  kernel <- rbind(top,long.strip,-top)
+  if (taper.width.factor != 0) {
+    gaussian <- dnorm(1:(2*half.width+middle.bit),
+                      half.width+0.5+0.5*middle.bit,
+                      2*taper.width.factor*half.width)
+    kernel <- sweep(kernel,2,gaussian,'*')
+    kernel <- sweep(kernel,1,gaussian,'*')
+  }
+  return(kernel)
+  }
+#so this makes the kernal, which then gets put into the calculate.foote.novelty function, below, along with dm
+# 2. calculate FN
+  calculate.foote.novelty <- function(dm, kernel) {
+# Calculate the Foote novelty given a distance matrix dm and the Foote kernel
+   n.date <- nrow(dm)
+   kernel.width <- ncol(kernel)
+   novelty <- mat.or.vec(n.date,1) * NA
+   n.step <- n.date - kernel.width
+   for (i in 1:n.step) {
+    ind <- i-1+(1:kernel.width)
+    novelty[i+ceiling(kernel.width/2)] <- sum(dm[ind,ind] * kernel)
+   }
+   return(novelty)
+}
+## 3.  bootstrap
+  diag.mm <- function(mat, offset=0, in.diag=c()) {
+    n <- dim(mat)[1]
+    m <- n-abs(offset)
+    if (length(in.diag) == 0) {
+      out.diag <- mat.or.vec(m,1)
+      for (i in 1:m) {
+        out.diag[i] <- mat[i, i+offset]
+      }
+      return(out.diag)
+    }
+    else {
+      for (i in 1:m) {
+        mat[i, i+offset] <- in.diag[i]
+      }
+      return(mat)
+    }
+  }
+  shuffle.diagonals <- function(mat, symm=TRUE) {
+    n <- dim(mat)[1]
+    for (i in 0:(n-1)) {
+      the.diag <- diag.mm(mat, offset=i)
+      shuffled.diag <- sample(the.diag)
+      mat <- diag.mm(mat, offset=i, in.diag=shuffled.diag)
+    }
+    mat[lower.tri(mat)] <- 0
+    mat <- mat + t(mat) - diag(diag(mat))
+    return(mat)
+  }
+  shuffled.bootstrap <- function(dm, kernel, n.boot) {
+    n.boot <- 100
+    foote.novelty <- calculate.foote.novelty(dm, kernel)
+    n.nov <- length(foote.novelty)
+    foote.novelty.scrambled <- mat.or.vec(n.boot, n.nov)
+    for (i.boot in 1:n.boot) {
+      shuffled.dm <- shuffle.diagonals(dm)
+      foote.novelty.scrambled[i.boot,] <- calculate.foote.novelty(shuffled.dm, kernel)
+    }
+    thresh <- quantile(foote.novelty.scrambled, c(0.025,0.975), na.rm = T)
+    return(thresh)
+  }
+## 4.  bind previous together, run, and return results in list
+  run.foot.novelty <- function(distance.matrix, half.width,  n.boot = 1000){
+# results list to return:
+    return.list <- list()
+# basic novelty
+    kernel <- make.foote.kernel(half.width = half.width) 
+    foote.novelty <- calculate.foote.novelty(distance.matrix, kernel)
+    thresh <- shuffled.bootstrap(distance.matrix, kernel, n.boot = n.boot ) # choose your number of bootstrap iterations
+    return.list$Thresh <-thresh
+    
+# a simple plot of novelty including very simple 95% confidence thresholds
+    
+    #print(plot(foote.novelty,type='b', main = paste('Novelty with half.width', half.width)))
+    #print(abline(h=thresh))
+# sort data for writing
+    foote.res<-as.data.frame(foote.novelty)
+    foote.res$year <- rownames(distance.matrix)
+# add results to return list
+    return.list$Foote.res <- foote.res
+    return(return.list)
+  }
+
+# RUNNING FOOTE NOVELTY FOR DIFFERENT WIDTHS
+# run through width vector
+  c <- 1
+  y <- 1
+  
+  for (i in width.vector){
+    foote.results[y:(y+years-1),3] <- i
+    new.nov <- run.foot.novelty(dm, half.width = i , n.boot = n.boot)
+    thresholds[c,] <- c(i, new.nov$Thresh)
+#foote.header<-c(foote.header, as.character(i))
+    foote.results[y:(y+years-1),2] <- new.nov$Foote.res[,1]
+    foote.results[y:(y+years-1),1] <- yearnames
+    c <- c+1
+    y <- y + years
+  }
+# export CSVs
+#write.csv(foote.results, file=ft.save.drcty , row.names=FALSE)
+#write.csv(thresholds, file= th.save.drcty, row.names=FALSE)
+# if we want to return the results that we saved in the csv file
+# return(return.list)
+list.to.return <- list()
+  list.to.return$Foote.res <- foote.results
+  list.to.return$Thresh <- thresholds
+  return(list.to.return)
+}
+```
+#### Run the FN calculator. 
+
+We are going to do this for all kernal widths that the data allow, so we need to calculate that.
+```{r}
+#calculate max_k, and use as upperlimit on k
+max_k<-floor((length(unique(rownames(dm)))-2)/2)
+#here set the range of kernal half-widths you want to use, but we are going to use all allowed 
+foote.results<-novelty.analysis(dm, c(1:max_k))
+````
+#### FN plot 
+
+With revolutions in red and conservative periods in blue, and different kernal widths in different shades of grey
+```{r}
+t<-foote.results$Thresh
+td<-as.data.frame(t)
+f<-foote.results$Foote.res
+fd<-as.data.frame(f)
+res<-merge(fd, t, by.x="hw", by.y="hw")
+res$year<-as.numeric(as.character(res$year))
+res$foote.novelty<-as.numeric(as.character(res$foote.novelty))
+res$upper<-ifelse(res$foote.novelty>=res$upper_97.5, 1, 0)
+res$lower<-ifelse(res$foote.novelty<=res$lower_2.5, 1, 0)
+res$fnbreaks<-cut(res$foote.novelty,breaks = 20,labels=1:20)
+res$fncolour<-ifelse(res$fnbreaks==1, "#F2F2F2",
+ifelse(res$fnbreaks==2, "#E5E5E5", 
+ifelse(res$fnbreaks==3,"#D8D8D8", 
+ifelse(res$fnbreaks==4,"#CBCBCB" ,
+ifelse(res$fnbreaks==5,"#BFBFBF", 
+ifelse(res$fnbreaks==6,"#B2B2B2", 
+ifelse(res$fnbreaks==7,"#A5A5A5", 
+ifelse(res$fnbreaks==8,"#989898", 
+ifelse(res$fnbreaks==9,"#8C8C8C", 
+ifelse(res$fnbreaks==10,"#7F7F7F", 
+ifelse(res$fnbreaks==11,"#727272", 
+ifelse(res$fnbreaks==12,"#656565", 
+ifelse(res$fnbreaks==13,"#595959", 
+ifelse(res$fnbreaks==14,"#4C4C4C", 
+ifelse(res$fnbreaks==15,"#3F3F3F", 
+ifelse(res$fnbreaks==16,"#323232", 
+ifelse(res$fnbreaks==17,"#262626", 
+ifelse(res$fnbreaks==18,"#191919", 
+ifelse(res$fnbreaks==19,"#0C0C0C", "#000000")))))))))))))))))))
+res$fncolour<-ifelse(res$lower==1,"steelblue1",
+ifelse(res$upper==1,"tomato",res$fncolour))
+```
+If your series is longer, you may want to make the size in "geom_vline" smaller so that the lines don't overlap. Experiment.
+```{r}
+fnplot<-ggplot()+
+geom_point(data=res, aes(x=year,y=hw, fill=(fncolour) , colour=fncolour, group=as.factor(hw)), size=7, alpha=1, shape=22)+
+geom_vline(xintercept=c(40,50), colour="tomato4", alpha=1, size=1)+
+guides(colour=FALSE)+
+ylab("k")+
+xlab("year")+
+scale_x_continuous(breaks=pretty_breaks(n=5), limits=c(min(res$year), max(res$year)))+#
+scale_y_continuous(breaks=pretty_breaks(n=5), limits=c(1, max_k))+
+scale_fill_identity()+
+scale_colour_identity()+
+theme_classic(base_size = 12, base_family = "sans")+
+theme(axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'), legend.position="bottom", text=element_text(size=10,  family="sans", colour = 'black'))
+fnplot
+````
+
+#### identify putative revolutions and conservative periods
+Here we pull out those dates where FN is greater than the significance threshold for revolutions, and smaller than the signficance threshold for conservative periods
+```{r}
+res$rev<-ifelse(is.na(res$upper),0, ifelse(res$upper==0, 0, 1))
+res$cons<-ifelse(is.na(res$lower),0, ifelse(res$lower==0, 0, 1))
+revs<-subset(res, rev=="1")
+cons<-subset(res, cons=="1")
+revs<-revs[order(revs$year, revs$hw),]
+cons<-cons[order(cons$year, cons$hw),]
+r<-rbind(revs,cons)
+write.csv(r, "revolutions.csv", row.names=FALSE)
+```
+
+#### estimate the expected number of False Positives
+We are carrying out MANY significance tests.  So, by we'll expect to get quite a few by chance alone.  To claim that there is a revolution, we want the observed number of significance tests to be greater than the number of tests observed by chance alone. To do this, we calculate the number of FN estimates that we've made, then how many of them might be signficant by chance along, and then how many of them were.
+````{r}
+FNcount<-length(res$foote.novelty[!is.na(res$foote.novelty)])
+sig<-subset(res, rev==1)
+sigFNcount<-length(sig$rev)
+````
+This is the number of tests you did
+````{r}
+FNcount
+````
+This is the number tests expected to be significant by chance alone, given alpha=0.05 (two tailed)
+````{r}
+FNcount*0.05/2
+````
+This is the number of signficant tests observed
+````{r}
+sigFNcount  
+````
+If the number of significant tests observed is greater than the number expected by chance, then you have at least one revolution in the data.
+
+#### make a total FN index, R.
+This is an index of the rate of change across all kernal.widths. The idea is that it tells us how much change is happing at any time, regardless of whether or not it is significant. It works like this:
+
+For each year, the sum of FN values, over all half-widths, k, (called "hw" in the data frame), divided by the sum of the mean FN values, over all k. But the complication is that the ks for which FN values are estimated vary among years. See "On Revolutions" for more.
+
+```{r}
+i1<-res[c(1:3)]
+#get the mean FN for all hw			   
+i2<-ddply(i1, .(hw), summarise,
+meanFN=mean(foote.novelty, na.rm=TRUE))
+#plot(i2$hw, i2$meanFN) 
+#merge with i1
+i1<-merge(i1, i2, by.x="hw", by.y="hw")
+#remove meanFNs from years in which they are not calculated
+#i1$meanFN<-as.numeric(as.character(ifelse(is.na(i1$foote.novelty), "NA", i1$meanFN)))
+i1$normFN<-i1$foote.novelty/i1$meanFN
+#get the sums of the normalized FNs
+i2<-ddply(i1, .(year), summarise,
+			   R=mean(normFN, na.rm=TRUE),
+        count = length(normFN))
+````
+This is a plot of "R" 
+````{r}
+indexplot<-ggplot()+
+geom_hline(yintercept=1, linetype="dotted", size=1, alpha=1)+
+geom_vline(xintercept=c(40,50), colour="tomato4", alpha=1, size=1)+
+geom_line(data=i2, aes(x=year,y=R), size=0.5, alpha=1)+
+guides(colour=FALSE)+
+ylab("R")+
+xlab("year")+
+scale_x_continuous(breaks=pretty_breaks(n=5), limits=c(min(res$year), max(res$year)))+#
+scale_y_continuous(breaks=pretty_breaks(n=5))+
+scale_fill_identity()+
+scale_colour_identity()+
+theme_classic(base_size = 12, base_family = "sans")+
+theme(axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'), legend.position="bottom", text=element_text(size=10,  family="sans", colour = 'black'))
+indexplot
+````               
+
+
