@@ -1,0 +1,384 @@
+---
+title: "Foote Novelty algorithm"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+### preamble
+
+This is the **Foote Novelty** algorithm given in *On Revolutions*. The script was written by Matthias Mauch and modified by Ben Lambert, Armand Leroi and Marina Papadopolou.
+
+We are going to use the pop data set as example. 
+
+### libraries
+```{r}
+library(reshape2)
+library(flexmix)
+library(ggplot2)
+library(plyr)
+library(scales)
+library(tidyr)
+library(broom)
+library(dplyr)
+library(data.table)
+options(mc.cores=parallel::detectCores())
+```
+### data
+
+All the data used in *On Revolutions* are in this file. It is in **long** format.
+```{r}
+d<-read.csv("revolutions_data.csv", header=TRUE)
+```
+subset the data to the dataset you want using "choosedata" 
+`````{r}
+levels(d$dataset)
+choosedata<-"pop"
+d1<-subset(d, dataset==choosedata)
+``````
+check how many variables you have
+`````{r}
+d1$variable<-as.character(d1$variable)
+unique(d1$variable)
+``````
+plot the data. It should all be **positive**
+```{r}
+ggplot()+
+geom_line(data=d1, aes(x=year, y=log10(value), colour=as.factor(variable),group=as.factor(variable)))+
+guides(colour=FALSE)+
+theme_classic() 
+````
+
+reshape data to **wide** format
+```{r}
+d2<-dcast(d1,year~variable, value.var="value")
+````
+
+### Prepare the data for a distance matrix
+
+Make distance matrix between years. 
+
+isolate the data
+`````{r}
+d3<-as.matrix(d2[c(2:ncol(d2))])
+``````
+The pop data are (topic) frequency data. Sometimes we will have removed traits (topics). So we want to normalize the frequencies so that they sum to 1
+```{r}
+yearsums<-rowSums(d3)
+f<-d3/yearsums
+````
+We have previously established that the pop data are highly persistent, and that differencing them once removes the persistence (makes them stationary).  So we want to use differenced data. Other data may require no differencing or differencing more than once.
+```{r}
+d4<-diff(d3, difference=1)
+```
+
+#### get the distance matrix. 
+
+We are going to use Jensen-Shannon distance, a symmetrized version of Kullback–Leibler divergence, since that's most suitable for these kind of data which are frequencies. We first get the KL divergence matrix and then do stuff to get the Jensen-Shannon distance.  For other kinds of data use any distance metric you please (e.g., Euclidean)
+```{r}
+yearmod<-tail(unique(d2$year),-1)
+rownames(d4)<-yearmod
+d5<-t(d4)
+d6<-KLdiv(as.matrix(d5))
+d7<-d6
+d7[lower.tri(d7)] <- 0
+dm.ut<-d7
+d9<-d6
+d9[upper.tri(d9)] <- 0
+dm.lt<- d9
+dm.ut.s<- dm.ut + t(dm.ut)
+dm.lt.s<- dm.lt + t(dm.lt)
+dm.s<- dm.ut.s + dm.lt.s
+dm.s<-sqrt(dm.s)
+dm<-dm.s
+````
+#### make a heatmap
+```{r}
+heatmap(dm ,Rowv= NA, Colv = NA)
+```
+
+Heatmaps of differenced data show much less structure than heatmap of undifferenced data. But perhaps there is still structure in there.
+
+### Foote Novelty estimation
+This is a single large function that takes the distance matrix, dm, and FN over all kernal widths, does the bootstrapping on the diagonals, and then gets the significance thresholds. 
+
+set the alpha level desired for significance testing
+`````{r}
+alpha=0.05
+````````
+
+```{r}
+low<-alpha/2
+high<-1-alpha/2
+novelty.analysis <- function(dm, width.vector = c(1,2,3), ft.save.drcty = "foote.results.csv",
+                             th.save.drcty = 'foote.thresh.csv', n.boot = 1000)
+  {
+# INITIALIZING: 
+# initialize output dataframes
+  thresholds <- data.frame(matrix(nrow = length(width.vector), ncol = 3))
+  thresh.header <- c('hw', 'lower', 'upper')
+  colnames(thresholds) <- thresh.header
+  
+  foote.results <- data.frame(matrix(nrow = (length(dm[1,])*length(width.vector)), ncol = 3))
+  foote.header <- c('year', 'foote.novelty', 'hw')
+  colnames(foote.results) <- foote.header
+#count years
+  years <-  length(rownames(dm))
+  yearnames <- rownames(dm)
+# DEFINING FUNCTIONS : 
+# 1. make the kernal
+  make.foote.kernel <- function(half.width, taper.width.factor=0.4, middle.bit=1) {
+# Make the Foote kernel
+# parameters:
+# taper.width.factor. Width of the Gaussian tapering (default 0.4; 0 = no tapering)
+#middle.bit size of the center (default: 1, as in DoP paper, Foote uses 0)
+  ones <- mat.or.vec(half.width, half.width) + 1
+  short.strip <- mat.or.vec(half.width,middle.bit)
+  top <- cbind(-ones,short.strip,ones)
+  long.strip <- mat.or.vec(middle.bit,2*half.width+middle.bit)
+  kernel <- rbind(top,long.strip,-top)
+  if (taper.width.factor != 0) {
+    gaussian <- dnorm(1:(2*half.width+middle.bit),
+                      half.width+0.5+0.5*middle.bit,
+                      2*taper.width.factor*half.width)
+    kernel <- sweep(kernel,2,gaussian,'*')
+    kernel <- sweep(kernel,1,gaussian,'*')
+  }
+  return(kernel)
+  }
+#so this makes the kernal, which then gets put into the calculate.foote.novelty function, below, along with dm
+# 2. calculate FN
+  calculate.foote.novelty <- function(dm, kernel) {
+# Calculate the Foote novelty given a distance matrix dm and the Foote kernel
+   n.date <- nrow(dm)
+   kernel.width <- ncol(kernel)
+   novelty <- mat.or.vec(n.date,1) * NA
+   n.step <- n.date - kernel.width
+   for (i in 1:n.step) {
+    ind <- i-1+(1:kernel.width)
+    novelty[i+ceiling(kernel.width/2)] <- sum(dm[ind,ind] * kernel)
+   }
+   return(novelty)
+}
+## 3.  bootstrap
+  diag.mm <- function(mat, offset=0, in.diag=c()) {
+    n <- dim(mat)[1]
+    m <- n-abs(offset)
+    if (length(in.diag) == 0) {
+      out.diag <- mat.or.vec(m,1)
+      for (i in 1:m) {
+        out.diag[i] <- mat[i, i+offset]
+      }
+      return(out.diag)
+    }
+    else {
+      for (i in 1:m) {
+        mat[i, i+offset] <- in.diag[i]
+      }
+      return(mat)
+    }
+  }
+  shuffle.diagonals <- function(mat, symm=TRUE) {
+    n <- dim(mat)[1]
+    for (i in 0:(n-1)) {
+      the.diag <- diag.mm(mat, offset=i)
+      shuffled.diag <- sample(the.diag)
+      mat <- diag.mm(mat, offset=i, in.diag=shuffled.diag)
+    }
+    mat[lower.tri(mat)] <- 0
+    mat <- mat + t(mat) - diag(diag(mat))
+    return(mat)
+  }
+  shuffled.bootstrap <- function(dm, kernel, n.boot) {
+    n.boot <- 100
+    foote.novelty <- calculate.foote.novelty(dm, kernel)
+    n.nov <- length(foote.novelty)
+    foote.novelty.scrambled <- mat.or.vec(n.boot, n.nov)
+    for (i.boot in 1:n.boot) {
+      shuffled.dm <- shuffle.diagonals(dm)
+      foote.novelty.scrambled[i.boot,] <- calculate.foote.novelty(shuffled.dm, kernel)
+    }
+    thresh <- quantile(foote.novelty.scrambled, c(low,high), na.rm = T)
+    return(thresh)
+  }
+## 4.  bind previous together, run, and return results in list
+  run.foot.novelty <- function(distance.matrix, half.width,  n.boot = 1000){
+# results list to return:
+    return.list <- list()
+# basic novelty
+    kernel <- make.foote.kernel(half.width = half.width) 
+    foote.novelty <- calculate.foote.novelty(distance.matrix, kernel)
+    thresh <- shuffled.bootstrap(distance.matrix, kernel, n.boot = n.boot ) # choose your number of bootstrap iterations
+    return.list$Thresh <-thresh
+    
+# a simple plot of novelty including very simple 95% confidence thresholds
+    
+    #print(plot(foote.novelty,type='b', main = paste('Novelty with half.width', half.width)))
+    #print(abline(h=thresh))
+# sort data for writing
+    foote.res<-as.data.frame(foote.novelty)
+    foote.res$year <- rownames(distance.matrix)
+# add results to return list
+    return.list$Foote.res <- foote.res
+    return(return.list)
+  }
+
+# RUNNING FOOTE NOVELTY FOR DIFFERENT WIDTHS
+# run through width vector
+  c <- 1
+  y <- 1
+  
+  for (i in width.vector){
+    foote.results[y:(y+years-1),3] <- i
+    new.nov <- run.foot.novelty(dm, half.width = i , n.boot = n.boot)
+    thresholds[c,] <- c(i, new.nov$Thresh)
+#foote.header<-c(foote.header, as.character(i))
+    foote.results[y:(y+years-1),2] <- new.nov$Foote.res[,1]
+    foote.results[y:(y+years-1),1] <- yearnames
+    c <- c+1
+    y <- y + years
+  }
+# export CSVs
+#write.csv(foote.results, file=ft.save.drcty , row.names=FALSE)
+#write.csv(thresholds, file= th.save.drcty, row.names=FALSE)
+# if we want to return the results that we saved in the csv file
+# return(return.list)
+list.to.return <- list()
+  list.to.return$Foote.res <- foote.results
+  list.to.return$Thresh <- thresholds
+  return(list.to.return)
+}
+```
+#### Run the FN calculator. 
+
+We are going to do this for all kernal widths that the data allow, so we need to calculate that.
+```{r}
+#calculate max_k, and use as upperlimit on k
+max_k<-floor((length(unique(rownames(dm)))-2)/2)
+#here set the range of kernal half-widths you want to use, but we are going to use all allowed 
+foote.results<-novelty.analysis(dm, c(1:max_k))
+````
+#### FN plot 
+This prepares your result for plotting, with revolutions in red, conservative periods in blue, and FN values in shades of grey
+```{r}
+t<-foote.results$Thresh
+td<-as.data.frame(t)
+f<-foote.results$Foote.res
+fd<-as.data.frame(f)
+res<-merge(fd, t, by.x="hw", by.y="hw")
+res$year<-as.numeric(as.character(res$year))
+res$foote.novelty<-as.numeric(as.character(res$foote.novelty))
+res<-as.data.table(res)
+res<-res %>% group_by(hw) %>% mutate(bin = cut(foote.novelty, breaks = 30,labels=1:30, include.lowest = TRUE))
+res<-as.data.frame(res)
+res$bin<-as.factor(res$bin)
+res2<-res
+res2$revcons<-as.character(ifelse(res2$foote.novelty>=res2$upper, "rev", ifelse(res$foote.novelty<=res2$lower, "cons", "neither")))
+res2$revcons[is.na(res2$revcons)] <- "NA"
+res2$revcons<- factor(res2$revcons, levels = c("rev", "cons", "NA"))
+res2<-as.data.frame(res2)
+```
+make palettes
+````{r}
+greys<-floor(seq(from=90, to=1, length.out=30))
+greys<-paste("grey", greys, sep="")
+pal1<-c(greys)
+pal2<-c("indianred3", "steelblue3", "white")
+```
+FN plot
+```{r}
+fnplot2<-ggplot()+
+geom_tile(data=res, aes(x=year,y=hw,fill=as.factor(bin)))+
+scale_fill_manual(values=c(pal1), na.value=NA)+
+geom_point(data=res2, aes(x=year,y=hw, colour=as.factor(revcons)), size=2, alpha=1)+
+scale_colour_manual(values=c(pal2))+
+ylab("k")+
+xlab("year")+
+guides(colour=FALSE, fill=FALSE)+
+scale_x_continuous(breaks=pretty_breaks(n=5), limits=c(min(res$year), max(res$year)))+#
+scale_y_continuous(breaks=pretty_breaks(n=5), limits=c(0, max_k))+
+theme_classic(base_size = 12, base_family = "sans")+
+theme(axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'), legend.position="bottom", text=element_text(size=10,  family="sans", colour = 'black'))
+fnplot2
+pdf(paste(choosedata, "FN_plot.pdf", sep="_")) # starts writing a PDF to file
+plot(fnplot2, width=10, height=10) # makes the actual plot
+dev.off()  
+```
+
+#### identify putative revolutions and conservative periods
+We pull out those dates where FN is greater than the significance threshold for revolutions, and smaller than the signficance threshold for conservative periods
+````{r}
+revconsperiods<-subset(res2, revcons=="rev"|revcons=="cons")
+revconsperiods<-revconsperiods[order(revconsperiods$year, revconsperiods$hw),]
+revconsperiods<-revconsperiods[c("year","hw","revcons")]
+revconsperiods
+write.csv(revconsperiods, paste(choosedata, "revs.csv", sep="_"), row.names=FALSE)
+````
+
+#### estimate the expected number of False Positives
+We are carrying out **many** significance tests.  So we expect to get quite a few significant results by chance alone.  To claim that there is a revolution, we want the observed number of significance tests to be greater than the number of tests observed by chance alone. To do this, we calculate the number of FN estimates that we've made, then how many of them might be signficant by chance along, and then how many of them were.
+
+How many tests we did
+````{r}
+FNcount<-length(res2$foote.novelty[!is.na(res2$foote.novelty)])
+FNcount
+````
+How many tests we expect to be significant by chance alone given the alpha (two tailed)
+````{r}
+sigFNchance<-FNcount*alpha/2
+sigFNchance
+````
+How many tests we observed weres significant given the alpha (two tailed)
+````{r}
+sig<-subset(res2, revcons=="rev")
+sigFNobs<-length(sig$revcons)
+sigFNobs  
+````
+If the number of significant tests observed is greater than the number expected by chance, then there is at least one revolution.
+````{r}
+ifelse(sigFNobs>sigFNchance, "There is a revolution", "There is no revolution")  
+````
+#### make a total FN index, R.
+This is an index, R, of the rate of change across all kernal.widths. It tells us how much change is happing at any time, regardless of whether or not there is a statisically significant revolution. See *On Revolutions* for details.
+
+```{r}
+i1<-res[c(1:3)]
+#get the mean FN for all hw			   
+i2<-ddply(i1, .(hw), summarise,
+meanFN=mean(foote.novelty, na.rm=TRUE))
+#plot(i2$hw, i2$meanFN) 
+#merge with i1
+i1<-merge(i1, i2, by.x="hw", by.y="hw")
+#remove meanFNs from years in which they are not calculated
+#i1$meanFN<-as.numeric(as.character(ifelse(is.na(i1$foote.novelty), "NA", i1$meanFN)))
+i1$normFN<-i1$foote.novelty/i1$meanFN
+#get the sums of the normalized FNs
+i2<-ddply(i1, .(year), summarise,
+			   R=mean(normFN, na.rm=TRUE),
+        count = length(normFN))
+````
+R plot
+````{r}
+indexplot<-ggplot()+
+geom_hline(yintercept=1, linetype="dotted", size=1, alpha=1)+
+geom_vline(xintercept=c(40,50), colour="tomato4", alpha=1, size=1)+
+geom_line(data=i2, aes(x=year,y=R), size=0.5, alpha=1)+
+guides(colour=FALSE)+
+ylab("R")+
+xlab("year")+
+scale_x_continuous(breaks=pretty_breaks(n=5), limits=c(min(res$year), max(res$year)))+#
+scale_y_continuous(breaks=pretty_breaks(n=5))+
+scale_fill_identity()+
+scale_colour_identity()+
+theme_classic(base_size = 12, base_family = "sans")+
+theme(axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'), legend.position="bottom", text=element_text(size=10,  family="sans", colour = 'black'))
+indexplot
+pdf(paste(choosedata, "R_plot.pdf", sep="_")) # starts writing a PDF to file
+plot(indexplot, width=10, height=10) # makes the actual plot
+dev.off()  
+````               
+
+
+
+
