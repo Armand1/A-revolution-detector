@@ -1,4 +1,4 @@
-# A-revolution-detector
+# A revolution detector
 
 This is the code and some data supporting Leroi et al. On Revolutions.
 It contains:
